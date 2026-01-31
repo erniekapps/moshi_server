@@ -3,10 +3,16 @@ const { useRef, useEffect, useState } = React;
 const baseURL = "" 
 
 const getBaseURL = () => {
-  // use current web app server domain to construct the url for the moshi app
+  // Detect current URL (e.g., https://ybv56dlfklszwb-3000.proxy.runpod.net)
   const currentURL = new URL(window.location.href);
-//   const wsProtocol = currentURL.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `ws://localhost:8000/ws`; 
+  
+  // Extract Pod ID (the part before the first hyphen)
+  const hostParts = currentURL.hostname.split('-');
+  const podId = hostParts[0];
+
+  // Construct the proxy URL for port 8000
+  // Result: wss://ybv56dlfklszwb-8000.proxy.runpod.net/ws
+  return `wss://${podId}-8000.proxy.runpod.net/ws`;
 }
 
 const App = () => {
