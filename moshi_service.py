@@ -87,11 +87,12 @@ async def status():
 
 @app.websocket("/ws")
 async def websocket(ws: WebSocket):
+    # Fix 1: Accept with subprotocol=None for proxy stability
+    await ws.accept(subprotocol=None)
+    
     with torch.no_grad():
-        await ws.accept()
         moshi.reset_state()
         print("Session started")
-        tasks = []
         websocket_closed = False
 
         async def recv_loop():
@@ -100,10 +101,12 @@ async def websocket(ws: WebSocket):
                 while not websocket_closed:
                     data = await ws.receive_bytes()
                     if not data:
-                        print("Received empty message")
+                        continue
+                    # Handle heartbeat/ping (0x00) if sent from client
+                    if len(data) == 1 and data[0] == 0x00:
                         continue
                     moshi.opus_stream_inbound.append_bytes(data)
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, Exception):
                 websocket_closed = True
                 print("Client disconnected in recv_loop")
 
@@ -139,7 +142,12 @@ async def websocket(ws: WebSocket):
                             text_token = tokens[0, 0, 0].item()
                             if text_token not in (0, 3):
                                 text = moshi.text_tokenizer.id_to_piece(text_token).replace("▁", " ")
-                                await ws.send_bytes(b"\x02" + bytes(text, "utf-8"))
+                                # Fix 2: Check socket state before sending text
+                                if not websocket_closed:
+                                    try:
+                                        await ws.send_bytes(b"\x02" + bytes(text, "utf-8"))
+                                    except:
+                                        websocket_closed = True
             except Exception as e:
                 websocket_closed = True
                 print(f"Inference loop error: {e}")
@@ -152,11 +160,19 @@ async def websocket(ws: WebSocket):
                     msg = moshi.opus_stream_outbound.read_bytes()
                     if msg is None or len(msg) == 0:
                         continue
-                    await ws.send_bytes(b"\x01" + msg)
-            except WebSocketDisconnect:
+                    
+                    # Fix 3: Safety check for sending audio on closed socket
+                    if not websocket_closed:
+                        try:
+                            await ws.send_bytes(b"\x01" + msg)
+                        except:
+                            websocket_closed = True
+                            break
+            except Exception:
                 websocket_closed = True
                 print("Send loop disconnected")
 
+        # Fix 4: Properly gather tasks to keep the session alive
         try:
             tasks = [
                 asyncio.create_task(recv_loop()),
@@ -165,14 +181,17 @@ async def websocket(ws: WebSocket):
             ]
             await asyncio.gather(*tasks)
 
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
             print("WebSocket disconnected")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            print(f"Unexpected session error: {e}")
         finally:
             websocket_closed = True
+            # Cancel all tasks on exit
             for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                if not task.done():
+                    task.cancel()
+            
+            # Clean up GPU resources
             moshi.reset_state()
-            print("Session ended")
+            print("Session ended and state reset")
