@@ -15,10 +15,10 @@ app = FastAPI()
 # Configure CORS settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],  
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all HTTP methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],  
+    allow_headers=["*"],  
 )
 
 class MoshiService:
@@ -32,7 +32,6 @@ class MoshiService:
         self.opus_stream_inbound = None
 
     def initialize(self):
-        # Download models
         mimi_weight = hf_hub_download("kyutai/moshika-pytorch-bf16", loaders.MIMI_NAME)
         self.mimi = loaders.get_mimi(mimi_weight, device=self.device)
         self.mimi.set_num_codebooks(8)
@@ -56,7 +55,6 @@ class MoshiService:
         )
         self.text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_config)
 
-        # Warm up the models
         for _ in range(4):
             chunk = torch.zeros(
                 1, 1, self.frame_size, dtype=torch.float32, device=self.device
@@ -76,8 +74,6 @@ class MoshiService:
         self.mimi.reset_streaming()
         self.lm_gen.reset_streaming()
 
-
-# Initialize the MoshiService instance
 moshi = MoshiService()
 moshi.initialize()
 
@@ -87,13 +83,25 @@ async def status():
 
 @app.websocket("/ws")
 async def websocket(ws: WebSocket):
-    # Fix 1: Accept with subprotocol=None for proxy stability
     await ws.accept(subprotocol=None)
     
     with torch.no_grad():
         moshi.reset_state()
         print("Session started")
         websocket_closed = False
+
+        # --- NEW: PING LOOP ---
+        async def ping_loop():
+            nonlocal websocket_closed
+            try:
+                while not websocket_closed:
+                    await asyncio.sleep(5)  # Keep-alive every 5 seconds
+                    if not websocket_closed:
+                        # Send a JSON ping; your index.html is now 
+                        # configured to ignore this string.
+                        await ws.send_json({"type": "ping"})
+            except:
+                websocket_closed = True
 
         async def recv_loop():
             nonlocal websocket_closed
@@ -102,8 +110,7 @@ async def websocket(ws: WebSocket):
                     data = await ws.receive_bytes()
                     if not data:
                         continue
-                    # Handle heartbeat/ping (0x00) if sent from client
-                    if len(data) == 1 and data[0] == 0x00:
+                    if len(data) <= 4 and data[0] == 0x00:
                         continue
                     moshi.opus_stream_inbound.append_bytes(data)
             except (WebSocketDisconnect, Exception):
@@ -142,7 +149,6 @@ async def websocket(ws: WebSocket):
                             text_token = tokens[0, 0, 0].item()
                             if text_token not in (0, 3):
                                 text = moshi.text_tokenizer.id_to_piece(text_token).replace("▁", " ")
-                                # Fix 2: Check socket state before sending text
                                 if not websocket_closed:
                                     try:
                                         await ws.send_bytes(b"\x02" + bytes(text, "utf-8"))
@@ -161,7 +167,6 @@ async def websocket(ws: WebSocket):
                     if msg is None or len(msg) == 0:
                         continue
                     
-                    # Fix 3: Safety check for sending audio on closed socket
                     if not websocket_closed:
                         try:
                             await ws.send_bytes(b"\x01" + msg)
@@ -172,12 +177,12 @@ async def websocket(ws: WebSocket):
                 websocket_closed = True
                 print("Send loop disconnected")
 
-        # Fix 4: Properly gather tasks to keep the session alive
         try:
             tasks = [
                 asyncio.create_task(recv_loop()),
                 asyncio.create_task(inference_loop()),
                 asyncio.create_task(send_loop()),
+                asyncio.create_task(ping_loop()), # Added ping_loop here
             ]
             await asyncio.gather(*tasks)
 
@@ -187,11 +192,9 @@ async def websocket(ws: WebSocket):
             print(f"Unexpected session error: {e}")
         finally:
             websocket_closed = True
-            # Cancel all tasks on exit
             for task in tasks:
                 if not task.done():
                     task.cancel()
             
-            # Clean up GPU resources
             moshi.reset_state()
             print("Session ended and state reset")
